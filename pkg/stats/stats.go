@@ -18,7 +18,8 @@ type ProcessInfo struct {
 	Name     string
 	CPU      float64
 	Mem      uint64
-	DiskIO   uint64
+	DiskIO   uint64 // Cumulative
+	DiskRate uint64 // Bytes per second
 	NetConns int
 }
 
@@ -52,12 +53,16 @@ type SystemStats struct {
 }
 
 type Monitor struct {
-	procs map[int32]*process.Process
+	procs     map[int32]*process.Process
+	lastStats map[int32]ProcessInfo
+	lastTime  time.Time
 }
 
 func NewMonitor() *Monitor {
 	return &Monitor{
-		procs: make(map[int32]*process.Process),
+		procs:     make(map[int32]*process.Process),
+		lastStats: make(map[int32]ProcessInfo),
+		lastTime:  time.Now(),
 	}
 }
 
@@ -122,6 +127,11 @@ func (m *Monitor) GetStats() (SystemStats, error) {
 	pids, err := process.Pids()
 	if err == nil {
 		var procInfos []ProcessInfo
+		now := time.Now()
+		duration := now.Sub(m.lastTime).Seconds()
+		if duration <= 0 {
+			duration = 1
+		}
 
 		for _, pid := range pids {
 			var proc *process.Process
@@ -138,7 +148,10 @@ func (m *Monitor) GetStats() (SystemStats, error) {
 
 			name, _ := proc.Name()
 
-			cpuVal, _ := proc.CPUPercent()
+			cpuVal, err := proc.CPUPercent()
+			if err != nil {
+				cpuVal = 0
+			}
 
 			memInfo, _ := proc.MemoryInfo()
 			memUsage := uint64(0)
@@ -152,18 +165,30 @@ func (m *Monitor) GetStats() (SystemStats, error) {
 				diskIO = io.ReadBytes + io.WriteBytes
 			}
 
+			diskRate := uint64(0)
+			if last, ok := m.lastStats[pid]; ok {
+				if diskIO >= last.DiskIO {
+					diskRate = uint64(float64(diskIO-last.DiskIO) / duration)
+				}
+			}
+
 			conns, _ := proc.Connections()
 			netConns := len(conns)
 
-			procInfos = append(procInfos, ProcessInfo{
+			info := ProcessInfo{
 				PID:      pid,
 				Name:     name,
 				CPU:      cpuVal,
 				Mem:      memUsage,
 				DiskIO:   diskIO,
+				DiskRate: diskRate,
 				NetConns: netConns,
-			})
+			}
+			procInfos = append(procInfos, info)
+			m.lastStats[pid] = info
 		}
+
+		m.lastTime = now
 
 		// Cleanup dead processes
 		activePids := make(map[int32]bool)
@@ -173,23 +198,52 @@ func (m *Monitor) GetStats() (SystemStats, error) {
 		for pid := range m.procs {
 			if !activePids[pid] {
 				delete(m.procs, pid)
+				delete(m.lastStats, pid)
 			}
 		}
 
 		// Sort and slice
-		s.TopCPU = getTop(procInfos, func(i, j int) bool { return procInfos[i].CPU > procInfos[j].CPU }, 5)
-		s.TopMem = getTop(procInfos, func(i, j int) bool { return procInfos[i].Mem > procInfos[j].Mem }, 5)
-		s.TopDisk = getTop(procInfos, func(i, j int) bool { return procInfos[i].DiskIO > procInfos[j].DiskIO }, 5)
-		s.TopNet = getTop(procInfos, func(i, j int) bool { return procInfos[i].NetConns > procInfos[j].NetConns }, 5)
+		s.TopCPU = getTop(procInfos, func(p1, p2 ProcessInfo) bool {
+			if p1.CPU != p2.CPU {
+				return p1.CPU > p2.CPU
+			}
+			return p1.PID < p2.PID
+		}, 5)
+
+		s.TopMem = getTop(procInfos, func(p1, p2 ProcessInfo) bool {
+			if p1.Mem != p2.Mem {
+				return p1.Mem > p2.Mem
+			}
+			return p1.PID < p2.PID
+		}, 5)
+
+		s.TopDisk = getTop(procInfos, func(p1, p2 ProcessInfo) bool {
+			if p1.DiskRate != p2.DiskRate {
+				return p1.DiskRate > p2.DiskRate
+			}
+			return p1.PID < p2.PID
+		}, 5)
+
+		s.TopNet = getTop(procInfos, func(p1, p2 ProcessInfo) bool {
+			if p1.NetConns != p2.NetConns {
+				return p1.NetConns > p2.NetConns
+			}
+			return p1.PID < p2.PID
+		}, 5)
 	}
 
 	return s, nil
 }
 
-func getTop(procs []ProcessInfo, less func(i, j int) bool, limit int) []ProcessInfo {
+func getTop(procs []ProcessInfo, less func(p1, p2 ProcessInfo) bool, limit int) []ProcessInfo {
+	if len(procs) == 0 {
+		return nil
+	}
 	sorted := make([]ProcessInfo, len(procs))
 	copy(sorted, procs)
-	sort.Slice(sorted, less)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		return less(sorted[i], sorted[j])
+	})
 	if len(sorted) > limit {
 		return sorted[:limit]
 	}

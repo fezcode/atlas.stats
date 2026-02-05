@@ -240,8 +240,8 @@ func (m model) View() string {
 		return formatBytes(p.Mem)
 	})
 
-	topDisk := renderProcTable("Top Disk I/O", m.stats.TopDisk, func(p stats.ProcessInfo) string {
-		return formatBytes(p.DiskIO)
+	topDisk := renderProcTable("Top Disk Rate", m.stats.TopDisk, func(p stats.ProcessInfo) string {
+		return fmt.Sprintf("%s/s", formatBytes(p.DiskRate))
 	})
 
 	topNet := renderProcTable("Top Net Conns", m.stats.TopNet, func(p stats.ProcessInfo) string {
