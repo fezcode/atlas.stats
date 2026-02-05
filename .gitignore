@@ -1,0 +1,6 @@
+atlas-stats
+atlas-stats.exe
+vendor/
+*.log
+.idea/
+build/
