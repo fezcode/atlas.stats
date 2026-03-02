@@ -14,30 +14,30 @@ import (
 var (
 	titleStyle = lipgloss.NewStyle().
 			Bold(true).
-			Foreground(lipgloss.Color("#FAFAFA")).
-			Background(lipgloss.Color("#7D56F4")).
+			Foreground(lipgloss.Color("#FFFDF5")).
+			Background(lipgloss.Color("#6B50FF")).
 			Padding(0, 1).
 			MarginBottom(1)
 
 	labelStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#ADADAD")).
+			Foreground(lipgloss.Color("#626262")).
 			Width(15)
 
 	valueStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#04B575")).
+			Foreground(lipgloss.Color("#00D787")).
 			Bold(true)
 
 	infoBoxStyle = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
-			BorderForeground(lipgloss.Color("#7D56F4")).
+			BorderForeground(lipgloss.Color("#6B50FF")).
 			Padding(1, 2).
 			MarginRight(1)
 
 	tableHeaderStyle = lipgloss.NewStyle().
 				Bold(true).
-				Foreground(lipgloss.Color("#FAFAFA")).
+				Foreground(lipgloss.Color("#FFFDF5")).
 				Border(lipgloss.NormalBorder(), false, false, true, false).
-				BorderForeground(lipgloss.Color("#555"))
+				BorderForeground(lipgloss.Color("#626262"))
 
 	tableRowStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#EEE"))
