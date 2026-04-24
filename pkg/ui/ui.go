@@ -1,336 +1,492 @@
 package ui
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"time"
 
 	"atlas.stats/pkg/stats"
-	"github.com/charmbracelet/bubbles/progress"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
 
-var (
-	titleStyle = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Color("#FFFDF5")).
-			Background(lipgloss.Color("#6B50FF")).
-			Padding(0, 1).
-			MarginBottom(1)
-
-	labelStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#626262")).
-			Width(15)
-
-	valueStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#00D787")).
-			Bold(true)
-
-	infoBoxStyle = lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(lipgloss.Color("#6B50FF")).
-			Padding(1, 2).
-			MarginRight(1)
-
-	tableHeaderStyle = lipgloss.NewStyle().
-				Bold(true).
-				Foreground(lipgloss.Color("#FFFDF5")).
-				Border(lipgloss.NormalBorder(), false, false, true, false).
-				BorderForeground(lipgloss.Color("#626262"))
-
-	tableRowStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#EEE"))
-)
-
 type tickMsg time.Time
+type snapMsg stats.Snapshot
 
 type model struct {
-	monitor  *stats.Monitor
-	stats    stats.SystemStats
-	cpuProg  progress.Model
-	memProg  progress.Model
-	diskProg progress.Model
+	monitor *stats.Monitor
+	version string
+	snap    stats.Snapshot
 
-	// State for bandwidth calc
-	lastNetSent uint64
-	lastNetRecv uint64
-	netHistory  []uint64
-
-	err          error
-	width        int
-	height       int
-	scrollOffset int
+	width, height int
+	scroll        int
+	paused        bool
+	blink         bool
+	frame         int
+	started       time.Time
 }
 
-func NewModel() model {
-	return model{
-		monitor:    stats.NewMonitor(),
-		cpuProg:    progress.New(progress.WithDefaultGradient()),
-		memProg:    progress.New(progress.WithDefaultGradient()),
-		diskProg:   progress.New(progress.WithDefaultGradient()),
-		netHistory: make([]uint64, 40),
-	}
+func newModel(m *stats.Monitor, version string) model {
+	return model{monitor: m, version: version, started: time.Now()}
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(tick(), m.updateStats())
+	return tea.Batch(heartbeat(), m.pullSnap())
 }
 
-func (m model) updateStats() tea.Cmd {
-	return func() tea.Msg {
-		s, err := m.monitor.GetStats()
-		if err != nil {
-			return err
-		}
-		return s
-	}
+func heartbeat() tea.Cmd {
+	return tea.Tick(500*time.Millisecond, func(t time.Time) tea.Msg { return tickMsg(t) })
 }
 
-func tick() tea.Cmd {
-	return tea.Tick(time.Second, func(t time.Time) tea.Msg {
-		return tickMsg(t)
-	})
+func (m model) pullSnap() tea.Cmd {
+	return func() tea.Msg { return snapMsg(m.monitor.Snapshot()) }
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch msg.String() {
-		case "q", "ctrl+c":
+		case "q", "ctrl+c", "esc":
 			return m, tea.Quit
+		case "p", " ":
+			m.paused = !m.paused
 		case "up", "k":
-			if m.scrollOffset > 0 {
-				m.scrollOffset--
+			if m.scroll > 0 {
+				m.scroll--
 			}
 		case "down", "j":
-			m.scrollOffset++ // View will clamp this
+			m.scroll++
+		case "g", "home":
+			m.scroll = 0
+		case "G", "end":
+			m.scroll = 9999
 		}
 	case tea.WindowSizeMsg:
-		m.width = msg.Width
-		m.height = msg.Height
-
-		barWidth := msg.Width/2 - 14
-		if msg.Width < 80 {
-			barWidth = msg.Width - 14
-		}
-		if barWidth < 10 {
-			barWidth = 10
-		}
-
-		m.cpuProg.Width = barWidth
-		m.memProg.Width = barWidth
-
+		m.width, m.height = msg.Width, msg.Height
+		m.scroll = 0
+		return m, tea.Batch(tea.ClearScreen, m.pullSnap())
 	case tickMsg:
-		return m, tea.Batch(tick(), m.updateStats())
-	case stats.SystemStats:
-		currTotal := msg.NetSent + msg.NetRecv
-		prevTotal := m.lastNetSent + m.lastNetRecv
-		bandwidth := uint64(0)
-
-		if prevTotal > 0 && currTotal >= prevTotal {
-			bandwidth = currTotal - prevTotal
+		m.frame++
+		m.blink = m.frame%2 == 0
+		if m.paused {
+			return m, heartbeat()
 		}
-
-		m.netHistory = append(m.netHistory[1:], bandwidth)
-		m.lastNetSent = msg.NetSent
-		m.lastNetRecv = msg.NetRecv
-
-		m.stats = msg
-		return m, nil
-	case error:
-		m.err = msg
-		return m, nil
+		return m, tea.Batch(heartbeat(), m.pullSnap())
+	case snapMsg:
+		m.snap = stats.Snapshot(msg)
 	}
 	return m, nil
 }
 
 func (m model) View() string {
-	if m.err != nil {
-		return fmt.Sprintf("Error: %v\n", m.err)
-	}
-
-	header := titleStyle.Render(" ATLAS STATS ")
-
-	boxWidth := m.width/2 - 4
-	isNarrow := m.width < 80
-	if isNarrow {
-		boxWidth = m.width - 4
-	}
-
-	// --- Row 1: System Info & Network ---
-	sysInfo := infoBoxStyle.Width(boxWidth).Render(lipgloss.JoinVertical(lipgloss.Left,
-		fmt.Sprintf("%s %s", labelStyle.Render("Hostname:"), valueStyle.Render(m.stats.Hostname)),
-		fmt.Sprintf("%s %s", labelStyle.Render("OS:"), valueStyle.Render(m.stats.OS)),
-		fmt.Sprintf("%s %s", labelStyle.Render("Platform:"), valueStyle.Render(m.stats.Platform)),
-		fmt.Sprintf("%s %s", labelStyle.Render("Uptime:"), valueStyle.Render(formatDuration(m.stats.Uptime))),
-	))
-
-	netRate := m.netHistory[len(m.netHistory)-1]
-	netInfo := infoBoxStyle.Width(boxWidth).Render(lipgloss.JoinVertical(lipgloss.Left,
-		lipgloss.NewStyle().Bold(true).Render("Network Activity"),
-		fmt.Sprintf("%s %s", labelStyle.Render("Total Sent:"), valueStyle.Render(formatBytes(m.stats.NetSent))),
-		fmt.Sprintf("%s %s", labelStyle.Render("Total Recv:"), valueStyle.Render(formatBytes(m.stats.NetRecv))),
-		fmt.Sprintf("%s %s", labelStyle.Render("Current Rate:"), valueStyle.Render(fmt.Sprintf("%s/s", formatBytes(netRate)))),
-	))
-
-	var row1 string
-	if isNarrow {
-		row1 = lipgloss.JoinVertical(lipgloss.Left, sysInfo, netInfo)
-	} else {
-		row1 = lipgloss.JoinHorizontal(lipgloss.Top, sysInfo, netInfo)
-	}
-
-	// --- Row 2: CPU & Memory (Now 2nd as requested) ---
-	cpuBar := m.cpuProg.ViewAs(m.stats.CPUUsage / 100)
-	cpuInfo := infoBoxStyle.Width(boxWidth).Render(lipgloss.JoinVertical(lipgloss.Left,
-		fmt.Sprintf("%s %s", labelStyle.Render("CPU Usage:"), valueStyle.Render(fmt.Sprintf("%.2f%%", m.stats.CPUUsage))),
-		cpuBar,
-	))
-
-	memUsage := 0.0
-	if m.stats.MemoryTotal > 0 {
-		memUsage = float64(m.stats.MemoryUsed) / float64(m.stats.MemoryTotal)
-	}
-	memBar := m.memProg.ViewAs(memUsage)
-	memInfo := infoBoxStyle.Width(boxWidth).Render(lipgloss.JoinVertical(lipgloss.Left,
-		fmt.Sprintf("%s %s", labelStyle.Render("Memory:"), valueStyle.Render(fmt.Sprintf("%s / %s", formatBytes(m.stats.MemoryUsed), formatBytes(m.stats.MemoryTotal)))),
-		memBar,
-	))
-
-	var row2 string
-	if isNarrow {
-		row2 = lipgloss.JoinVertical(lipgloss.Left, cpuInfo, memInfo)
-	} else {
-		row2 = lipgloss.JoinHorizontal(lipgloss.Top, cpuInfo, memInfo)
-	}
-
-	// --- Row 3: Disks (Now 3rd as requested) ---
-	var diskBoxes []string
-	diskCount := len(m.stats.Disks)
-	if diskCount == 0 {
-		diskBoxes = append(diskBoxes, infoBoxStyle.Width(m.width-4).Render("No disks found"))
-	} else {
-		diskBoxWidth := 44
-		if isNarrow {
-			diskBoxWidth = m.width - 4
-		}
-
-		m.diskProg.Width = diskBoxWidth - 10
-
-		for _, d := range m.stats.Disks {
-			bar := m.diskProg.ViewAs(d.UsedPercent / 100.0)
-			view := infoBoxStyle.Width(diskBoxWidth).Render(lipgloss.JoinVertical(lipgloss.Left,
-				fmt.Sprintf("%s %s", labelStyle.Render("Mount:"), valueStyle.Render(d.Path)),
-				fmt.Sprintf("%s %s", labelStyle.Render("Usage:"), valueStyle.Render(fmt.Sprintf("%.1f%%", d.UsedPercent))),
-				fmt.Sprintf("%s / %s", formatBytes(d.Used), formatBytes(d.Total)),
-				bar,
-			))
-			diskBoxes = append(diskBoxes, view)
-		}
-	}
-	row3 := wrapBoxes(diskBoxes, m.width)
-
-	// --- Row 4: Top Processes ---
-	topCPU := renderProcTable("Top CPU", m.stats.TopCPU, func(p stats.ProcessInfo) string {
-		return fmt.Sprintf("%.1f%%", p.CPU)
-	})
-
-	topMem := renderProcTable("Top Mem", m.stats.TopMem, func(p stats.ProcessInfo) string {
-		return formatBytes(p.Mem)
-	})
-
-	topDisk := renderProcTable("Top Disk Rate", m.stats.TopDisk, func(p stats.ProcessInfo) string {
-		return fmt.Sprintf("%s/s", formatBytes(p.DiskRate))
-	})
-
-	topNet := renderProcTable("Top Net Conns", m.stats.TopNet, func(p stats.ProcessInfo) string {
-		return fmt.Sprintf("%d", p.NetConns)
-	})
-
-	row4 := wrapBoxes([]string{topCPU, topMem, topDisk, topNet}, m.width)
-
-	fullContent := lipgloss.JoinVertical(lipgloss.Left,
-		header,
-		row1,
-		row2,
-		row3,
-		row4,
-		"\n Use ↑/↓ or j/k to navigate • Press 'q' to quit",
-	)
-
-	lines := strings.Split(fullContent, "\n")
-
-	// Clamping scrollOffset
-	maxOffset := len(lines) - m.height
-	if maxOffset < 0 {
-		maxOffset = 0
-	}
-	if m.scrollOffset > maxOffset {
-		m.scrollOffset = maxOffset
-	}
-	if m.scrollOffset < 0 {
-		m.scrollOffset = 0
-	}
-
-	visibleLines := lines[m.scrollOffset:]
-	if len(visibleLines) > m.height {
-		visibleLines = visibleLines[:m.height]
-	}
-
-	return strings.Join(visibleLines, "\n")
-}
-
-func wrapBoxes(boxes []string, maxWidth int) string {
-	if len(boxes) == 0 {
+	if m.width == 0 || m.height == 0 {
 		return ""
 	}
+	if m.width < 64 {
+		return sCrit.Render(" terminal too narrow — resize to ≥ 64 columns ")
+	}
 
-	var finalRows []string
-	var currentRow []string
-	currentWidth := 0
+	var blocks []string
+	blocks = append(blocks, m.renderMasthead())
 
-	for _, box := range boxes {
-		w := lipgloss.Width(box)
-		if currentWidth+w > maxWidth && len(currentRow) > 0 {
-			finalRows = append(finalRows, lipgloss.JoinHorizontal(lipgloss.Top, currentRow...))
-			currentRow = nil
-			currentWidth = 0
+	twoCol := m.width >= 100
+	gutter := 1
+	if twoCol {
+		halfW := (m.width - gutter) / 2
+		otherW := m.width - gutter - halfW
+
+		kernel := m.renderKernel(halfW)
+		network := m.renderNetwork(otherW)
+		blocks = append(blocks, joinH(gutter, kernel, network))
+
+		cpu := m.renderCPU(halfW)
+		memB := m.renderMemory(otherW)
+		blocks = append(blocks, joinH(gutter, cpu, memB))
+	} else {
+		blocks = append(blocks,
+			m.renderKernel(m.width),
+			m.renderNetwork(m.width),
+			m.renderCPU(m.width),
+			m.renderMemory(m.width),
+		)
+	}
+	blocks = append(blocks,
+		m.renderStorage(m.width),
+		m.renderTopProcs(m.width),
+	)
+
+	body := strings.Join(blocks, "\n")
+
+	full := body + "\n" + m.renderFooter()
+
+	// Apply scroll window. Always pad to height so shrinking the terminal
+	// doesn't leave ghosts from the previous (taller) paint.
+	lines := strings.Split(full, "\n")
+	available := m.height
+	if len(lines) <= available {
+		blank := strings.Repeat(" ", m.width)
+		for len(lines) < available {
+			lines = append(lines, blank)
 		}
-		currentRow = append(currentRow, box)
-		currentWidth += w
+		return strings.Join(lines, "\n")
 	}
-
-	if len(currentRow) > 0 {
-		finalRows = append(finalRows, lipgloss.JoinHorizontal(lipgloss.Top, currentRow...))
+	maxOff := len(lines) - available
+	if m.scroll > maxOff {
+		m.scroll = maxOff
 	}
-
-	return lipgloss.JoinVertical(lipgloss.Left, finalRows...)
+	if m.scroll < 0 {
+		m.scroll = 0
+	}
+	return strings.Join(lines[m.scroll:m.scroll+available], "\n")
 }
 
-func renderProcTable(title string, procs []stats.ProcessInfo, valueFn func(stats.ProcessInfo) string) string {
+// --- Masthead ---------------------------------------------------------------
+
+func (m model) renderMasthead() string {
+	s := m.snap
+	w := m.width
+
+	rule := sBorder.Render(strings.Repeat("━", w))
+
+	// Title: spaced caps
+	title := sMastTitle.Render("A T L A S") +
+		sDim.Render("  ·  ") +
+		sMastTitle.Render("T E L E M E T R Y")
+
+	// Right side: clock · REC/PAUSED · version
+	clock := sMastClock.Render(time.Now().Format("15:04:05"))
+	var rec string
+	switch {
+	case m.paused:
+		rec = sHot.Render("◼ PAUSED")
+	case m.blink:
+		rec = sRec.Render("● REC")
+	default:
+		rec = sDim.Render("● REC")
+	}
+	ver := sDim.Render("v" + m.version)
+	right := horiz(clock, rec, ver)
+
+	// Line 1: title left, right meta right-justified.
+	titleW := lipgloss.Width(title)
+	rightW := lipgloss.Width(right)
+	pad := w - 2 - titleW - rightW
+	if pad < 1 {
+		pad = 1
+	}
+	line1 := "  " + title + strings.Repeat(" ", pad) + right
+
+	// Line 2: meta
+	host := sDim.Render("HOST ") + sValue.Render(nonempty(s.Hostname, "—"))
+	plat := sDim.Render("PLATFORM ") + sValue.Render(nonempty(s.Platform, s.OS))
+	up := sDim.Render("UPTIME ") + sValue.Render(formatUptime(s.Uptime))
+	cores := sDim.Render("CORES ") + sValue.Render(fmt.Sprintf("%d", s.NumCPU))
+	line2 := "  " + horiz(host, plat, cores, up)
+	// Trim if too long.
+	if lipgloss.Width(line2) > w {
+		line2 = "  " + horiz(host, plat, up)
+	}
+	if lipgloss.Width(line2) > w {
+		line2 = "  " + horiz(host, up)
+	}
+
+	return strings.Join([]string{rule, line1, line2, rule}, "\n")
+}
+
+// --- Sections ---------------------------------------------------------------
+
+func (m model) renderKernel(w int) string {
+	s := m.snap
+	col := 11
+	body := strings.Join([]string{
+		labelValue("HOST", sValue.Render(nonempty(s.Hostname, "—")), col),
+		labelValue("OS", sValue.Render(nonempty(s.OS, "—")), col),
+		labelValue("PLATFORM", sValue.Render(truncateVisible(nonempty(s.Platform, "—"), w-col-4)), col),
+		labelValue("UPTIME", sValue.Render(formatUptime(s.Uptime)), col),
+	}, "\n")
+	return section("01", "KERNEL", body, w)
+}
+
+func (m model) renderNetwork(w int) string {
+	s := m.snap
+	col := 11
+	sparkW := w - col - 4 - 14 // 14 for value slot
+	if sparkW < 6 {
+		sparkW = 6
+	}
+	tx := formatBytes(s.NetSent)
+	rx := formatBytes(s.NetRecv)
+	rate := formatRate(s.NetRate)
+	pill := bytesRatePill(s.NetRate)
+
+	spark := sparkline(s.NetHistory, 0, sparkW)
+
+	line1 := labelValue("TX", sValue.Render(fmt.Sprintf("%-10s", tx)), col) + "  " + spark
+	line2 := labelValue("RX", sValue.Render(fmt.Sprintf("%-10s", rx)), col)
+	line3 := labelValue("RATE", sValue.Render(fmt.Sprintf("%-10s", rate))+"  "+pill, col)
+	body := strings.Join([]string{line1, line2, line3, " "}, "\n")
+	return section("02", "NETWORK", body, w)
+}
+
+func (m model) renderCPU(w int) string {
+	s := m.snap
+	col := 11
+	gw := w - col - 4 - 14
+	if gw < 6 {
+		gw = 6
+	}
+	gauge := segmentedGauge(s.CPUUsage, gw)
+	spark := sparkline(s.CPUHistory, 100, w-col-4)
+	usageTxt := levelStyle(s.CPUUsage).Render(fmt.Sprintf("%5.1f%%", s.CPUUsage))
+
+	line1 := labelValue("LOAD", usageTxt+"  "+statusPill(s.CPUUsage), col)
+	line2 := labelValue("USAGE", gauge, col)
+	line3 := labelValue("HIST", spark, col)
+	body := strings.Join([]string{line1, line2, line3, " "}, "\n")
+	return section("03", "CPU", body, w)
+}
+
+func (m model) renderMemory(w int) string {
+	s := m.snap
+	col := 11
+	gw := w - col - 4 - 14
+	if gw < 6 {
+		gw = 6
+	}
+	pct := 0.0
+	if s.MemoryTotal > 0 {
+		pct = 100 * float64(s.MemoryUsed) / float64(s.MemoryTotal)
+	}
+	gauge := segmentedGauge(pct, gw)
+	spark := sparkline(s.MemHistory, 100, w-col-4)
+
+	used := fmt.Sprintf("%s / %s", formatBytes(s.MemoryUsed), formatBytes(s.MemoryTotal))
+	free := formatBytes(s.MemoryFree)
+
+	line1 := labelValue("USED", sValue.Render(used)+"  "+statusPill(pct), col)
+	line2 := labelValue("FREE", sValue.Render(free), col)
+	line3 := labelValue("USAGE", gauge, col)
+	line4 := labelValue("HIST", spark, col)
+	body := strings.Join([]string{line1, line2, line3, line4}, "\n")
+	return section("04", "MEMORY", body, w)
+}
+
+func (m model) renderStorage(w int) string {
+	s := m.snap
+	if len(s.Disks) == 0 {
+		return section("05", "STORAGE", sDim.Render("no disks reported"), w)
+	}
+	col := 11
+	// compute widths
+	mountW := 0
+	for _, d := range s.Disks {
+		if lipgloss.Width(d.Path) > mountW {
+			mountW = lipgloss.Width(d.Path)
+		}
+	}
+	if mountW < 6 {
+		mountW = 6
+	}
+	sizeW := 22
+	pctW := 7
+	pillW := 10
+	_ = col
+	gw := w - 4 - mountW - 2 - sizeW - 2 - pctW - 2 - pillW - 2
+	if gw < 8 {
+		gw = 8
+	}
 	var rows []string
-	rows = append(rows, tableHeaderStyle.Render(fmt.Sprintf("%-20s %10s", title, "Value")))
-
-	for _, p := range procs {
-		name := p.Name
-		if len(name) > 18 {
-			name = name[:15] + "..."
-		}
-		val := valueFn(p)
-		rows = append(rows, tableRowStyle.Render(fmt.Sprintf("%-20s %10s", name, val)))
+	for _, d := range s.Disks {
+		mount := sPaper.Render(pad(d.Path, mountW))
+		size := sValue.Render(pad(fmt.Sprintf("%s / %s", formatBytes(d.Used), formatBytes(d.Total)), sizeW))
+		pct := levelStyle(d.UsedPercent).Render(pad(fmt.Sprintf("%5.1f%%", d.UsedPercent), pctW))
+		gauge := segmentedGauge(d.UsedPercent, gw)
+		pill := statusPill(d.UsedPercent)
+		rows = append(rows, fmt.Sprintf("%s  %s  %s  %s  %s", mount, size, pct, gauge, pill))
 	}
-
-	for len(rows) < 7 {
-		rows = append(rows, " ")
-	}
-
-	return infoBoxStyle.Width(35).Render(lipgloss.JoinVertical(lipgloss.Left, rows...))
+	return section("05", "STORAGE", strings.Join(rows, "\n"), w)
 }
 
-func formatDuration(seconds uint64) string {
+func (m model) renderTopProcs(w int) string {
+	s := m.snap
+
+	type col struct {
+		title string
+		marker string
+		procs []stats.ProcessInfo
+		fmt   func(stats.ProcessInfo) string
+	}
+	cols := []col{
+		{"CPU", "◉", s.TopCPU, func(p stats.ProcessInfo) string { return fmt.Sprintf("%5.1f%%", p.CPU) }},
+		{"MEMORY", "◉", s.TopMem, func(p stats.ProcessInfo) string { return formatBytes(p.Mem) }},
+		{"DISK I/O", "◉", s.TopDisk, func(p stats.ProcessInfo) string { return formatRate(p.DiskRate) }},
+		{"NETWORK", "◉", s.TopNet, func(p stats.ProcessInfo) string { return fmt.Sprintf("%d", p.NetConns) }},
+	}
+
+	inner := w - 4
+	colsPerRow := 4
+	switch {
+	case inner < 48:
+		colsPerRow = 1
+	case inner < 88:
+		colsPerRow = 2
+	case inner < 120:
+		colsPerRow = 3
+	}
+	gutter := 2
+	colW := (inner - gutter*(colsPerRow-1)) / colsPerRow
+
+	// For each column, produce a list of lines.
+	colLines := make([][]string, len(cols))
+	for i, c := range cols {
+		colLines[i] = renderProcColumn(c.marker, c.title, c.procs, c.fmt, colW)
+	}
+
+	// Group into rows of colsPerRow columns, joining horizontally.
+	var body []string
+	for start := 0; start < len(cols); start += colsPerRow {
+		end := min(start+colsPerRow, len(cols))
+		group := colLines[start:end]
+		// Normalize to same line count.
+		maxLen := 0
+		for _, g := range group {
+			if len(g) > maxLen {
+				maxLen = len(g)
+			}
+		}
+		for i := range group {
+			for len(group[i]) < maxLen {
+				group[i] = append(group[i], strings.Repeat(" ", colW))
+			}
+		}
+		for r := 0; r < maxLen; r++ {
+			var parts []string
+			for i := range group {
+				parts = append(parts, group[i][r])
+			}
+			body = append(body, strings.Join(parts, strings.Repeat(" ", gutter)))
+		}
+		if end < len(cols) {
+			body = append(body, strings.Repeat(" ", inner))
+		}
+	}
+
+	return section("06", "TOP PROCESSES", strings.Join(body, "\n"), w)
+}
+
+func renderProcColumn(marker, title string, ps []stats.ProcessInfo, fmtVal func(stats.ProcessInfo) string, width int) []string {
+	if width < 16 {
+		width = 16
+	}
+
+	head := sAmber.Render(marker) + " " + sSectionTitle.Render(title)
+	// Pad head to width
+	headW := lipgloss.Width(head)
+	if headW < width {
+		head += strings.Repeat(" ", width-headW)
+	}
+	rule := sBorder.Render(strings.Repeat("─", width))
+
+	lines := []string{head, rule}
+	valW := 9
+	rankW := 3
+	nameW := width - rankW - 1 - valW - 1
+	if nameW < 6 {
+		nameW = 6
+	}
+	for i, p := range ps {
+		rank := sDim.Render(fmt.Sprintf("%02d", i+1))
+		name := truncateVisible(p.Name, nameW)
+		nameStyled := sText.Render(pad(name, nameW))
+		val := sValue.Render(padRight(fmtVal(p), valW))
+		line := rank + " " + nameStyled + " " + val
+		// Ensure total is width.
+		lw := lipgloss.Width(line)
+		if lw < width {
+			line += strings.Repeat(" ", width-lw)
+		}
+		lines = append(lines, line)
+	}
+	for len(lines) < 8 {
+		lines = append(lines, strings.Repeat(" ", width))
+	}
+	return lines
+}
+
+// --- Footer -----------------------------------------------------------------
+
+func (m model) renderFooter() string {
+	keys := []string{
+		sFooterKey.Render("[Q]") + sFooterText.Render("·QUIT"),
+		sFooterKey.Render("[↑↓ J/K]") + sFooterText.Render("·SCROLL"),
+		sFooterKey.Render("[G]") + sFooterText.Render("·TOP"),
+		sFooterKey.Render("[P/␣]") + sFooterText.Render("·PAUSE"),
+	}
+	left := " " + strings.Join(keys, "   ")
+	var right string
+	if m.paused {
+		right = sHot.Render(" [ PAUSED ] ")
+	} else {
+		right = sDim.Render(fmt.Sprintf(" sampling · %s ", time.Since(m.started).Truncate(time.Second)))
+	}
+	pad := m.width - lipgloss.Width(left) - lipgloss.Width(right)
+	if pad < 1 {
+		pad = 1
+	}
+	return left + strings.Repeat(" ", pad) + right
+}
+
+// --- Helpers ---------------------------------------------------------------
+
+func joinH(gutter int, parts ...string) string {
+	if gutter <= 0 {
+		return lipgloss.JoinHorizontal(lipgloss.Top, parts...)
+	}
+	gutterStr := strings.Repeat(" ", gutter)
+	spaced := make([]string, 0, 2*len(parts)-1)
+	for i, p := range parts {
+		if i > 0 {
+			spaced = append(spaced, gutterStr)
+		}
+		spaced = append(spaced, p)
+	}
+	return lipgloss.JoinHorizontal(lipgloss.Top, spaced...)
+}
+
+func pad(s string, n int) string {
+	w := lipgloss.Width(s)
+	if w >= n {
+		return s
+	}
+	return s + strings.Repeat(" ", n-w)
+}
+
+func padRight(s string, n int) string {
+	w := lipgloss.Width(s)
+	if w >= n {
+		return s
+	}
+	return strings.Repeat(" ", n-w) + s
+}
+
+func nonempty(s, fb string) string {
+	if strings.TrimSpace(s) == "" {
+		return fb
+	}
+	return s
+}
+
+func formatUptime(seconds uint64) string {
 	d := time.Duration(seconds) * time.Second
-	return d.String()
+	days := int(d / (24 * time.Hour))
+	d -= time.Duration(days) * 24 * time.Hour
+	hours := int(d / time.Hour)
+	d -= time.Duration(hours) * time.Hour
+	mins := int(d / time.Minute)
+	d -= time.Duration(mins) * time.Minute
+	secs := int(d / time.Second)
+	return fmt.Sprintf("T+ %03dd %02dh %02dm %02ds", days, hours, mins, secs)
 }
 
 func formatBytes(b uint64) string {
@@ -346,8 +502,35 @@ func formatBytes(b uint64) string {
 	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
 }
 
-func Start() error {
-	p := tea.NewProgram(NewModel(), tea.WithAltScreen())
+func formatRate(bps uint64) string {
+	return formatBytes(bps) + "/s"
+}
+
+func bytesRatePill(bps uint64) string {
+	// thresholds: <256KB/s NOM, <4MB/s OK, <32MB/s ELEV, else CRIT
+	switch {
+	case bps < 256*1024:
+		return sGood.Render("[ NOM  ]")
+	case bps < 4*1024*1024:
+		return sAmber.Render("[  OK  ]")
+	case bps < 32*1024*1024:
+		return sHot.Render("[ ELEV ]")
+	default:
+		return sCrit.Render("[ CRIT ]")
+	}
+}
+
+// --- Entry point ------------------------------------------------------------
+
+// Start launches the UI. It starts a stats collector goroutine that runs until
+// the program exits.
+func Start(version string) error {
+	monitor := stats.NewMonitor()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go monitor.Run(ctx, time.Second)
+
+	p := tea.NewProgram(newModel(monitor, version), tea.WithAltScreen())
 	_, err := p.Run()
 	return err
 }

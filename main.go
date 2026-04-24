@@ -23,7 +23,7 @@ func main() {
 		return
 	}
 
-	if err := ui.Start(); err != nil {
+	if err := ui.Start(Version); err != nil {
 		fmt.Printf("Error starting UI: %v\n", err)
 		os.Exit(1)
 	}
